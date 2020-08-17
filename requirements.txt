@@ -2,3 +2,4 @@ coloredlogs==14.0
 humanfriendly==8.2
 jsocket==1.7
 pyparsing==2.4.6
+cryptography>=2.5

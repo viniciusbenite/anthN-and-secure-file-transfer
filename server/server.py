@@ -2,19 +2,36 @@ import json
 import binascii
 import argparse
 import coloredlogs, logging
-import os
 import jsocket
 import copy
+import base64
+import os
+import random
+import string
+import json
+import re
+import cryptography.hazmat.primitives.serialization as serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes, hmac
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.asymmetric import dh
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 logger = logging.getLogger('jserver')
 
+# Static vars
 STATE_CONNECT = 0 # Cliend Just Connected
 STATE_KEYEX   = 1 # Key Exchange
 STATE_AUTHN   = 3 # AUTHeNtication
 STATE_AUTHZ   = 3 # AUTHoriZation
 STATE_GET    = 4 # Data Transfer
+STATE_AGREEMENT = 5
 
 #GLOBAL
+backend = default_backend()
+
 user_list = {'username_a': 
 				{
 					'fullname': 'User Name A',
@@ -33,7 +50,16 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 		Default constructor
 		"""
 		self.state = STATE_CONNECT
-
+		
+		self.algorithm = None
+		self.mode = None
+		self.synthesis = None
+		self.iv = None
+		self.protocols = {
+			'algorithms': ['3DES', 'AES'],
+			'modes': ['ECB', 'CBC'],
+			'synthesis': ['MD5', 'SHA-256']
+		}
 
 	def _process_message(self, message: dict) -> None:
 		"""
@@ -103,6 +129,36 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 
 		self.send({'type': 'OK'})
 		self.state = STATE_KEYEX
+		return True
+
+	def process_agreement(self, message: str) -> bool:
+		self.state = STATE_AGREEMENT
+		
+		# Definir alg
+		if message['algorithm'] not in self.protocols['algorithms']:
+			logger.info('Algorithm not found!')
+			return False
+		self.algorithm = message["algorithm"]
+		
+		# Definir modo
+		if message['mode'] not in self.protocols['modes']:
+			logger.info('Mode not found!')
+			return False
+		self.mode = message["mode"]
+
+		# Definir sinstese
+		if message['synthesis'] not in self.protocols['synthesis']:
+			logger.info('synthesis not found!')
+			return False
+		self.synthesis = message["synthesis"]
+		
+		# Definir iv
+		self.iv = base64.b64decode(message['iv'])
+
+		logger.info(
+			f'algoritmo: {self.algorithm}, modo: {self.mode}, sintese: {self.synthesis}, iv:{self.iv}')
+		message = {'type': 'AGREEMENT_OK'}
+		self._send(message)
 		return True
 
 	def process_keyex(self, message: dict) -> bool:
@@ -178,7 +234,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 		:return bool
 		"""
 
-
+		# TODO: Função para enviar o arquivo para o cliente
 		if self.state != STATE_GET:
 			logger.warning("Invalid state. Discarding")
 			return False
@@ -222,6 +278,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 		:param message:
 		:return:
 		"""
+		# TODO: NOTHING TO BE DONE HERE!
 		logger.debug("Send: {}".format(json.dumps(message, indent=4)))
 		self.send_obj(message)
 

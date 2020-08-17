@@ -3,12 +3,45 @@ import coloredlogs, logging
 import binascii
 import argparse
 
-logger = logging.getLogger('jclient')
+import cryptography.hazmat.primitives.serialization as serialization
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes, hmac, padding
+from cryptography.hazmat.primitives.asymmetric import dh, rsa
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.asymmetric import utils
+from cryptography.hazmat.primitives.asymmetric import padding as pdr
+from cryptography import x509
+
+logger = logging.getLogger('jclient') 
+
+# Static vars
+STATE_INITIAL = 0
+STATE_KEYEX = 1
+STATE_OPEN = 2
+STATE_DATA = 3
+STATE_CLOSE = 4
 
 class Client(jsocket.JsonClient):
-    def __init__(self, address="127.0.0.1", port=5000):
+    def __init__(self, address="127.0.0.1", port=5000, file_name):
         super(Client, self).__init__(address, port)
 
+        self.file_name = file_name
+
+        self.algorithm = None
+        self.mode = None
+        self.hash_function = None
+        self.iv = None
+        self.protocols = {
+            'algorithms': ['3DES', 'AES'],
+            'modes': ['ECB', 'CBC'],
+            'hash_function': ['SHA-256', 'MD5'],
+        }
+
+        self.key = None
+        self.private_key = None
+        self.public_key = None
 
     def do_connect(self):
         """
@@ -17,15 +50,39 @@ class Client(jsocket.JsonClient):
         """
 
         self.connect()
+        logger.debug("Connected to server")
 
         self.send({"type": "CONNECT"})
         data = self.read()
     
         mtype = data.get('type', 'UNKNOWN')
         if mtype != 'OK':
+            logger.debug("Connection failed!!")
             raise Exception("Error from server")
 
         # Do stuff
+        
+        self.state = STATE_KEYEX
+        #TODO: negociar!
+
+    def do_agreement(self) -> None:
+        #TODO: Por agora, a negociação é aleatória
+        self.algorithm = self.protocols.get('algorithms')[random.randint(0,1)]
+        self.mode = self.protocols.get('modes')[random.randint(0,1)]
+        self.hash_function = self.protocols.get('hash_function')[random.randint(0,1)]
+
+        if self.algorithm == 'AES':
+            self.iv = os.urandom(16)
+        elif self.algorithm == '3DES':
+            self.iv = os.urandom(8)
+
+        msg = {'type': 'AGREEMENT',
+					'algorithm': self.algorithm,
+					'mode': self.mode,
+					'hash_function': self.hash_function,
+					'iv' : base64.b64encode(self.iv).decode('utf-8')}
+
+        self.send(msg)
 
 
     def do_keyexchange(self):
@@ -34,13 +91,12 @@ class Client(jsocket.JsonClient):
             Further communications may use the keys to secure all content
 
         """
-        self.send({"type": "KEYEX"})
-        data = self.read()
     
         mtype = data.get('type', 'UNKNOWN')
         if mtype != 'OK':
             raise Exception("Error from server")
-        # Do stuff
+
+        data = self.read()
 
     def do_authenticate(self) -> None:
         """
@@ -136,8 +192,44 @@ class Client(jsocket.JsonClient):
             
             :param message: Message to encrypt
         """
-        # Encrypt  message and convert to base64
-        message = {'type': 'SECURE', 'payload': message}
+        cipher = None
+        block_size = 0
+        backend = default_backend()
+
+        # Encrypt
+        # Algorithm
+        if self.algorithm == 'AES':
+            alg = algorithms.AES(self.key)
+            block_size = alg.block_size
+        elif self.algorithm == '3DES':
+            alg = algorithms.3DES(self.key)
+            block_size = alg.block_size
+
+        # Mode
+        if self.mode == 'ECB':
+            modo = modes.ECB()
+        elif self.mode == 'CBC':
+            modo = modes.CBC(self.iv)
+        cipher = Cipher(alg, modo, backend=default_backend())
+
+        # Synthesis
+        if self.synthesis == 'SHA-256':
+            sintese = hashes.SHA256()
+        elif self.synthesis == 'MD5':
+            sintese = hashes.MD5()
+        encryptor = cipher.encryptor()
+
+        # Convert to base64
+        msg = base64.b64encode(message)
+        padder = padding.PKCS7(block_size).padder()
+        p_data = padder.update(msg) + padder.finalize()
+        text = encryptor.update(p_data) + encryptor.finalize()
+        h = hmac.HMAC(self.key, sintese, backend=default_backend())
+        h.update(text)
+        h_mac = h.finalize()
+        # TODO: check this
+        payload = text, h_mac
+        message = {'type': 'SECURE', 'payload': payload}
         return message
 
     def decrypt(self, message: dict) -> dict:
@@ -152,7 +244,42 @@ class Client(jsocket.JsonClient):
             logger.error("Cannot decrypt message")
             raise Exception("Cannot decrypt message")
 
-        return message.get('payload')
+        cipher = None
+        block_size = 0
+        payload = message.get('payload')
+        text, h_mac = payload
+        # TODO: duplicação de código. CHECK THIS
+        # Algorithm
+        if self.algorithm == 'AES':
+            alg = algorithms.AES(self.key)
+            block_size = alg.block_size
+        elif self.algorithm == '3DES':
+            alg = algorithms.3DES(self.key)
+            block_size = alg.block_size
+
+        # Mode
+        if self.mode == 'ECB':
+            modo = modes.ECB()
+        elif self.mode == 'CBC':
+            modo = modes.CBC(self.iv)
+        cipher = Cipher(alg, modo, backend=default_backend())
+
+        # Synthesis
+        if self.synthesis == 'SHA-256':
+            sintese = hashes.SHA256()
+        elif self.synthesis == 'MD5':
+            sintese = hashes.MD5()
+
+        # Decrypt msg
+        decryptor = cipher.decryptor()
+        unpadder = padding.PKCS7(block_size).unpadder()
+        h = hmac.HMAC(self.key, sintese, backend=default_backend())
+        h.update(text)
+        h.verify(h_mac)
+        p_data = decryptor.update(text) + decryptor.finalize()
+        data = unpadder.update(p_data) + unpadder.finalize()
+        final_data = base64.b64decode(data)
+        return final_data
 
 
     def verify_integrity_control(self, message: dict) -> bool:
