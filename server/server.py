@@ -18,6 +18,10 @@ from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.asymmetric import dh
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.asymmetric import utils
+from cryptography.hazmat.primitives.asymmetric import padding as padder
+from cryptography.hazmat.primitives import hashes
+from cryptography import x509
 
 logger = logging.getLogger('jserver')
 
@@ -27,7 +31,7 @@ STATE_KEYEX = 1  # Key Exchange
 STATE_AUTHN = 3  # AUTHeNtication
 STATE_AUTHZ = 3  # AUTHoriZation
 STATE_GET = 4  # Data Transfer
-STATE_AGREEMENT = 5
+STATE_AGREEMENT = 5 # Negotiation phase
 
 # GLOBAL
 backend = default_backend()
@@ -138,6 +142,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         # Do Stuff
 
         self.send({'type': 'CONNECT_OK'})
+        logger.info("ADVANCING STATE")
         self.state = STATE_AGREEMENT
         # self.state = STATE_KEYEX # original
         return True
@@ -166,11 +171,13 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         # Definir iv
         self.iv = base64.b64decode(message['iv'])
 
+        logger.info("NEGOTIATION ONGOING. RECEIVED FROM CLIENT:")
         logger.info(
-            f'algoritmo: {self.algorithm}, modo: {self.mode}, sintese: {self.hash_function}, iv:{self.iv}')
+            f'Algorithm: {self.algorithm}, Mode: {self.mode}, Hash function: {self.hash_function}, IV:{self.iv}')
         message = {'type': 'AGREEMENT_OK'}
         self._send(message)
         # Advance state
+        logger.info("ADVANCING STATE")
         self.state = STATE_KEYEX
         return True
 
@@ -218,6 +225,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 
         self.send(msg)
         # In the last message of this process advance the state
+        logger.info("ADVANCING STATE")
         self.state = STATE_AUTHN
         return True
 
@@ -237,11 +245,33 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 
         # do authenticate
         self.server_nonce = base64.b64decode(message["nonce"])
+        # TODO: check pass.... ok
+        # Load server pri_key
+        with open("./sv-keys/key.pem") as k:
+            self.sv_key = serialization.load_pem_private_key(k.read(), password=None, backend=default_backend())
 
+        # Get pub_key
+        hs = hashes.Hash(hashes.SHA256(), backend=default_backend())
+        hs.update(self.server_nonce)
+        digested_hash = hs.finalize()
+
+        nonce = self.sv_key.sign(digested_hash,
+        padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
+
+        # sv certificate
+        with open("./sv-keys/rootCA.crt") as s:
+            self.sv_crt = x509.load_pem_x509_certificate(s.read(), backend=default_backend())
+        b_sv_cert = self.sv_crt.public_bytes(serialization.Encoding.DER)
+
+        # Send all to client
+        text = str.encode(json.dumps( { "type": "AUTHN_OK", "nonce": base64.b64encode(nonce).decode("utf-8") }))
+        payload, mac = self.encrypt(text)
+        msg = {"type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "mac": base64.b64encode(mac).decode("utf-8")}
+
+        self.send(msg)
         
-
-        self.send({'type': 'OK'})
         # In the last message of this process advance the state
+        logger.info("ADVANCING STATE")
         self.state = STATE_AUTHZ
         return True
 
@@ -321,6 +351,53 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         logger.debug("Send: {}".format(json.dumps(message, indent=4)))
         msg = (json.dumps(message) + '\r\n').encode()
         self._send(msg)
+
+    #TODO: codigo duplicado. ohh no!
+    def encrypt(self, message: dict) -> dict:
+        """
+            Encrypt a message
+            
+            :param message: Message to encrypt
+        """
+        cipher = None
+        block_size = 0
+
+        # Encrypt
+        # Algorithm
+        if self.algorithm == 'AES':
+            alg = algorithms.AES(self.key)
+            block_size = alg.block_size
+        elif self.algorithm == '3DES':
+            alg = algorithms.TripleDES(self.key)
+            block_size = alg.block_size
+
+        # Mode
+        if self.mode == 'ECB':
+            modo = modes.ECB()
+        elif self.mode == 'CBC':
+            modo = modes.CBC(self.iv)
+        cipher = Cipher(alg, modo, backend=default_backend())
+
+        # Synthesis
+        if self.hash_function == 'SHA-256':
+            sintese = hashes.SHA256()
+        elif self.hash_function == 'MD5':
+            sintese = hashes.MD5()
+        encryptor = cipher.encryptor()
+
+        # Convert to base64
+        msg = base64.b64encode(message)
+        padder = padding.PKCS7(block_size).padder()
+        p_data = padder.update(msg) + padder.finalize()
+        text = encryptor.update(p_data) + encryptor.finalize()
+        h = hmac.HMAC(self.key, sintese, backend=default_backend())
+        h.update(text)
+        h_mac = h.finalize()
+        # TODO: check this
+        payload = text, h_mac
+        message = {'type': 'SECURE', 'payload': payload}
+
+        return message
 
 
 def main():
