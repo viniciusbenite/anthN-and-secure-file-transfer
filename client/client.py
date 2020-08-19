@@ -1,8 +1,12 @@
 import jsocket
-import coloredlogs, logging
+import coloredlogs
+import logging
 import binascii
 import argparse
-
+import json
+import random
+import os
+import base64
 import cryptography.hazmat.primitives.serialization as serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -14,20 +18,20 @@ from cryptography.hazmat.primitives.asymmetric import utils
 from cryptography.hazmat.primitives.asymmetric import padding as pdr
 from cryptography import x509
 
-logger = logging.getLogger('jclient') 
+logger = logging.getLogger('jclient')
 
 # Static vars
-STATE_INITIAL = 0
-STATE_KEYEX = 1
-STATE_OPEN = 2
-STATE_DATA = 3
-STATE_CLOSE = 4
+STATE_CONNECT = 0  # Cliend Just Connected
+STATE_KEYEX = 1  # Key Exchange
+STATE_AUTHN = 3  # AUTHeNtication
+STATE_AUTHZ = 3  # AUTHoriZation
+STATE_GET = 4  # Data Transfer
+STATE_AGREEMENT = 5
+
 
 class Client(jsocket.JsonClient):
-    def __init__(self, address="127.0.0.1", port=5000, file_name):
+    def __init__(self, address="127.0.0.1", port=5000):
         super(Client, self).__init__(address, port)
-
-        self.file_name = file_name
 
         self.algorithm = None
         self.mode = None
@@ -36,12 +40,14 @@ class Client(jsocket.JsonClient):
         self.protocols = {
             'algorithms': ['3DES', 'AES'],
             'modes': ['ECB', 'CBC'],
-            'hash_function': ['SHA-256', 'MD5'],
+            'hash_functions': ['SHA-256', 'MD5'],
         }
 
         self.key = None
         self.private_key = None
         self.public_key = None
+
+        self.received_data = ""
 
     def do_connect(self):
         """
@@ -50,26 +56,27 @@ class Client(jsocket.JsonClient):
         """
 
         self.connect()
-        logger.debug("Connected to server")
+        logger.debug("Trying to connect to server")
 
         self.send({"type": "CONNECT"})
         data = self.read()
-    
+
         mtype = data.get('type', 'UNKNOWN')
-        if mtype != 'OK':
+        if mtype != 'CONNECT_OK':
             logger.debug("Connection failed!!")
             raise Exception("Error from server")
 
         # Do stuff
-        
-        self.state = STATE_KEYEX
-        #TODO: negociar!
+
+        self.state = STATE_AGREEMENT
+        # TODO: negociar!
 
     def do_agreement(self) -> None:
-        #TODO: Por agora, a negociação é aleatória
-        self.algorithm = self.protocols.get('algorithms')[random.randint(0,1)]
-        self.mode = self.protocols.get('modes')[random.randint(0,1)]
-        self.hash_function = self.protocols.get('hash_function')[random.randint(0,1)]
+        # TODO: Por agora, a negociação é aleatória
+        self.algorithm = self.protocols.get('algorithms')[random.randint(0, 1)]
+        self.mode = self.protocols.get('modes')[random.randint(0, 1)]
+        self.hash_function = self.protocols.get(
+            'hash_function')[random.randint(0, 1)]
 
         if self.algorithm == 'AES':
             self.iv = os.urandom(16)
@@ -79,11 +86,11 @@ class Client(jsocket.JsonClient):
         msg = {'type': 'AGREEMENT',
 					'algorithm': self.algorithm,
 					'mode': self.mode,
-					'hash_function': self.hash_function,
-					'iv' : base64.b64encode(self.iv).decode('utf-8')}
+					'hash_functions': self.hash_function,
+					'iv': base64.b64encode(self.iv).decode('utf-8')}
 
         self.send(msg)
-
+        self.state = STATE_KEYEX
 
     def do_keyexchange(self):
         """
@@ -91,26 +98,70 @@ class Client(jsocket.JsonClient):
             Further communications may use the keys to secure all content
 
         """
-    
-        mtype = data.get('type', 'UNKNOWN')
-        if mtype != 'OK':
-            raise Exception("Error from server")
-
         data = self.read()
+
+        mtype = data.get('type', 'UNKNOWN')
+        if mtype != 'AGREEMENT_OK':
+            raise Exception("Error from server")
+        logger.info("STATE: KEYEX")
+
+		# do key exchange
+        params = dh.generate_parameters(generator=2, key_size=512, backend=default_backend())
+
+        # Private key
+        self.private_key = params.generate_private_key()
+
+        # Public key
+        self.public_key = self.private_key.public_key()
+
+        public_key_bytes = self.public_key.public_bytes(serialization.Encoding.DER,
+                                                        serialization.PublicFormat.SubjectPublicKeyInfo)
+
+        # Prime numbers
+        p = params.parameter_numbers().p
+        g = params.parameter_numbers().g
+
+        msg = {'type': 'KEYEX',
+        'public_key': base64.b64encode(public_key_bytes).decode('utf-8'),
+        'p': p,
+        'g': g}
+        self.send(msg)
+        # Advance state
+        self.state = STATE_AUTHN
 
     def do_authenticate(self) -> None:
         """
             Send server an authentication request
             May need to obtain user credentials
         """
-
-        self.send({"type": "AUTHN"})
+        #TODO: isso vai dar pau. To bad!
         data = self.read()
-    
+
+        logger.info("Begining authn process")
+        decod_server_pub_key = base64.b64decode(data['server_public_key'])
+        server_pub_key = serialization.load_der_public_key(decod_server_pub_key, backend=default_backend())
+        shared_key = self.private_key.exchange(server_pub_key)
+
+        # Derivation
+        self.key = HKDF(algorithm=hashes.SHA256(),
+        length=16,
+        salt=os.urandom(16),
+        info=b'derivation',
+        backend=default_backend()).derive(shared_key)
+
+        # Send request
+        self.server_nonce = os.urandom(16)
+        text = str.encode(json.dumps({ "type": 'AUTHN', "nonce": base64.b64encode(self.server_nonce).decode('utf-8')}))
+        payload, mac = self.encrypt(text)
+        msg = { "type": 'SECURE', "payload": base64.b64encode(payload).decode('utf-8'),
+        "HMAC": base64.b64encode(mac).decode('utf-8')}
+        self.send(msg)
+
         mtype = data.get('type', 'UNKNOWN')
         if mtype != 'OK':
             raise Exception("Error from server")
 
+        self.state = STATE_AUTHZ
         # Do stuff
 
     def do_authorize(self) -> None:
@@ -121,7 +172,7 @@ class Client(jsocket.JsonClient):
 
         self.send({"type": "AUTHZ"})
         data = self.read()
-    
+
         mtype = data.get('type', 'UNKNOWN')
         if mtype != 'OK':
             raise Exception("Error from server")
@@ -136,20 +187,20 @@ class Client(jsocket.JsonClient):
         """
         self.send({"type": "GET", "file_name": file_name})
         data = self.read()
-        
+
         mtype = data.get('type', 'UNKNOWN')
         if mtype != 'OK':
             raise Exception("Error from server")
 
         data = self.read()
-        
+
         mtype = data.get('type', 'UNKNOWN')
         if mtype != 'DATA':
             raise Exception("Error from server")
 
         logger.info("Got file: {}".format(file_name))
         payload = binascii.a2b_base64(data.get('payload', None))
-        
+
         with open(file_name, "wb") as f:
             f.write(payload)
 
@@ -164,10 +215,9 @@ class Client(jsocket.JsonClient):
 
         logger.debug("Send: {}".format(message))
 
-        # Encrypt, adapt, etc... 
-
-        return self.send_obj(message)
-
+        # Encrypt, adapt, etc...
+        msg = (json.dumps(message) + '\r\n').encode()
+        return self._send(msg)
 
     def read(self) -> dict:
         """
@@ -194,7 +244,6 @@ class Client(jsocket.JsonClient):
         """
         cipher = None
         block_size = 0
-        backend = default_backend()
 
         # Encrypt
         # Algorithm
@@ -202,7 +251,7 @@ class Client(jsocket.JsonClient):
             alg = algorithms.AES(self.key)
             block_size = alg.block_size
         elif self.algorithm == '3DES':
-            alg = algorithms.3DES(self.key)
+            alg = algorithms.TripleDES(self.key)
             block_size = alg.block_size
 
         # Mode
@@ -213,9 +262,9 @@ class Client(jsocket.JsonClient):
         cipher = Cipher(alg, modo, backend=default_backend())
 
         # Synthesis
-        if self.synthesis == 'SHA-256':
+        if self.hash_function == 'SHA-256':
             sintese = hashes.SHA256()
-        elif self.synthesis == 'MD5':
+        elif self.hash_function == 'MD5':
             sintese = hashes.MD5()
         encryptor = cipher.encryptor()
 
@@ -254,7 +303,7 @@ class Client(jsocket.JsonClient):
             alg = algorithms.AES(self.key)
             block_size = alg.block_size
         elif self.algorithm == '3DES':
-            alg = algorithms.3DES(self.key)
+            alg = algorithms.TripleDES(self.key)
             block_size = alg.block_size
 
         # Mode
@@ -265,9 +314,9 @@ class Client(jsocket.JsonClient):
         cipher = Cipher(alg, modo, backend=default_backend())
 
         # Synthesis
-        if self.synthesis == 'SHA-256':
+        if self.hash_function == 'SHA-256':
             sintese = hashes.SHA256()
-        elif self.synthesis == 'MD5':
+        elif self.hash_function == 'MD5':
             sintese = hashes.MD5()
 
         # Decrypt msg

@@ -1,14 +1,14 @@
 import json
 import binascii
 import argparse
-import coloredlogs, logging
+import coloredlogs
+import logging
 import jsocket
 import copy
 import base64
 import os
 import random
 import string
-import json
 import re
 import cryptography.hazmat.primitives.serialization as serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -22,304 +22,346 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 logger = logging.getLogger('jserver')
 
 # Static vars
-STATE_CONNECT = 0 # Cliend Just Connected
-STATE_KEYEX   = 1 # Key Exchange
-STATE_AUTHN   = 3 # AUTHeNtication
-STATE_AUTHZ   = 3 # AUTHoriZation
-STATE_GET    = 4 # Data Transfer
+STATE_CONNECT = 0  # Cliend Just Connected
+STATE_KEYEX = 1  # Key Exchange
+STATE_AUTHN = 3  # AUTHeNtication
+STATE_AUTHZ = 3  # AUTHoriZation
+STATE_GET = 4  # Data Transfer
 STATE_AGREEMENT = 5
 
-#GLOBAL
+# GLOBAL
 backend = default_backend()
 
-user_list = {'username_a': 
-				{
-					'fullname': 'User Name A',
-					'certificate': '',
-					'can_connect': True,
-					'can_read': False
-				}
-			}
+user_list = {'username_a':
+             {
+                 'fullname': 'User Name A',
+                 'certificate': '',
+                 'can_connect': True,
+                 'can_read': False
+             }
+             }
 
 storage_dir = 'files'
 
+
 class ServerFactoryThread(jsocket.ServerFactoryThread):
-	def __init__(self):
-		super(ServerFactoryThread, self).__init__()
-		"""
+    def __init__(self):
+        super(ServerFactoryThread, self).__init__()
+        """
 		Default constructor
 		"""
-		self.state = STATE_CONNECT
-		
-		self.algorithm = None
-		self.mode = None
-		self.synthesis = None
-		self.iv = None
-		self.protocols = {
-			'algorithms': ['3DES', 'AES'],
-			'modes': ['ECB', 'CBC'],
-			'synthesis': ['MD5', 'SHA-256']
-		}
+        self.state = STATE_CONNECT
 
-	def _process_message(self, message: dict) -> None:
-		"""
-		Called when a frame (JSON Object) is extracted
+        self.algorithm = None
+        self.mode = None
+        self.hash_function = None
+        self.iv = None
+        self.protocols = {
+            'algorithms': ['3DES', 'AES'],
+            'modes': ['ECB', 'CBC'],
+            'hash_functions': ['MD5', 'SHA-256']
+        }
 
-		:param message: The JSON object to process
-		:return:
-		"""
-		try:
-			logger.debug("Process Message. Object: {}".format(message))
-			self.process_client_message(eval(str(message)))
-		except:
-			logger.exception("process_message")
+        self.key = None
+        self.private_key = None
+        self.public_key = None
 
-	def process_client_message(self, message: dict) -> None:
-		"""
-		Process a message send by the client
-		:param message: The JSON object to process
-		:return: 
-		"""
+    def _process_message(self, message: dict) -> None:
+        """
+        Called when a frame (JSON Object) is extracted
 
-		mtype = message.get('type', "").upper()
-		
-		ret = False
+        :param message: The JSON object to process
+        :return:
+        """
+        try:
+            logger.debug("Process Message. Object: {}".format(message))
+            self.process_client_message(eval(str(message)))
+        except:
+            logger.exception("process_message")
 
-		if mtype == 'SECURE':
-			message = self.process_secure(message)
+    def process_client_message(self, message: dict) -> None:
+        """
+        Process a message send by the client
+        :param message: The JSON object to process
+        :return: 
+        """
 
-		if message is not None:
-			mtype = message.get('type', "").upper()
-			if mtype == 'CONNECT':
-				ret = self.process_connect(message)
-			elif mtype == 'KEYEX':
-				ret = self.process_keyex(message)
-			elif mtype == 'AUTHN':
-				ret = self.process_authn(message)
-			elif mtype == 'AUTHZ':
-				ret = self.process_authz(message)
-			elif mtype == 'GET':
-				ret = self.process_get(message)
-			else:
-				logger.warning("Invalid message type: {}".format(message['type']))
+        mtype = message.get('type', "").upper()
 
-		if not ret:
-			try:
-				self.send({'type': 'ERROR', 'message': 'See server and restart the process'})
-			except:
-				pass # Silently ignore
+        ret = False
 
-			logger.info("Closing connection")
+        if mtype == 'SECURE':
+            #TODO pass for now
+            # message = self.process_secure(message)
+            pass
+        if message is not None:
+            mtype = message.get('type', "").upper()
+            if mtype == 'CONNECT':
+                ret = self.process_connect(message)
+            elif mtype == 'AGREEMENT':
+                ret = self.process_agreement(message)
+            elif mtype == 'KEYEX':
+                ret = self.process_keyex(message)
+            elif mtype == 'AUTHN':
+                ret = self.process_authn(message)
+            elif mtype == 'AUTHZ':
+                ret = self.process_authz(message)
+            elif mtype == 'GET':
+                ret = self.process_get(message)
+            else:
+                logger.warning(
+                    "Invalid message type: {}".format(message['type']))
 
-			self.state = STATE_CONNECT
-			self.close()
+        if not ret:
+            try:
+                self.send(
+                    {'type': 'ERROR', 'message': 'See server and restart the process'})
+            except:
+                pass  # Silently ignore
 
-	def process_connect(self, message: dict) -> bool:
-		"""
-		Process a connect request from the client
-		Nothing much is done. Maybe we can authorize the IP?
-		"""
+            logger.info("Closing connection")
 
-		if self.state != STATE_CONNECT:
-			logger.warning("Invalid state. Discarding")
-			return False
-		logger.info("STATE: CONNECT")
+            self.state = STATE_CONNECT
+            self.close()
 
-		# Do Stuff
+    def process_connect(self, message: dict) -> bool:
+        """
+        Process a connect request from the client
+        Nothing much is done. Maybe we can authorize the IP?
+        """
 
-		self.send({'type': 'OK'})
-		self.state = STATE_KEYEX
-		return True
+        if self.state != STATE_CONNECT:
+            logger.warning("Invalid state. Discarding")
+            return False
+        logger.info("STATE: CONNECT")
 
-	def process_agreement(self, message: str) -> bool:
-		self.state = STATE_AGREEMENT
-		
-		# Definir alg
-		if message['algorithm'] not in self.protocols['algorithms']:
-			logger.info('Algorithm not found!')
-			return False
-		self.algorithm = message["algorithm"]
-		
-		# Definir modo
-		if message['mode'] not in self.protocols['modes']:
-			logger.info('Mode not found!')
-			return False
-		self.mode = message["mode"]
+        # Do Stuff
 
-		# Definir sinstese
-		if message['synthesis'] not in self.protocols['synthesis']:
-			logger.info('synthesis not found!')
-			return False
-		self.synthesis = message["synthesis"]
-		
-		# Definir iv
-		self.iv = base64.b64decode(message['iv'])
+        self.send({'type': 'CONNECT_OK'})
+        self.state = STATE_AGREEMENT
+        # self.state = STATE_KEYEX # original
+        return True
 
-		logger.info(
-			f'algoritmo: {self.algorithm}, modo: {self.mode}, sintese: {self.synthesis}, iv:{self.iv}')
-		message = {'type': 'AGREEMENT_OK'}
-		self._send(message)
-		return True
+    def process_agreement(self, message: str) -> bool:
+        self.state = STATE_AGREEMENT
 
-	def process_keyex(self, message: dict) -> bool:
-		"""
-		Process messages related with the Key Exchange process
+        # Definir alg
+        if message['algorithm'] not in self.protocols['algorithms']:
+            logger.info('Algorithm not found!')
+            return False
+        self.algorithm = message["algorithm"]
 
-		:param message: The JSON object from the client
-		:return bool
-		"""
+        # Definir modo
+        if message['mode'] not in self.protocols['modes']:
+            logger.info('Mode not found!')
+            return False
+        self.mode = message["mode"]
 
-		if self.state != STATE_KEYEX:
-			logger.warning("Invalid state. Discarding")
-			return False
-		logger.info("STATE: KEY_EXCHANGE")
+        # Definir sinstese
+        if message['hash_functions'] not in self.protocols['hash_functions']:
+            logger.info('hash_function not found!')
+            return False
+        self.hash_function = message["hash_functions"]
 
-		# do key exchange
+        # Definir iv
+        self.iv = base64.b64decode(message['iv'])
 
-		self.send({'type': 'OK'})
-		# In the last message of this process advance the state
-		self.state = STATE_AUTHN
-		return True
+        logger.info(
+            f'algoritmo: {self.algorithm}, modo: {self.mode}, sintese: {self.hash_function}, iv:{self.iv}')
+        message = {'type': 'AGREEMENT_OK'}
+        self._send(message)
+        # Advance state
+        self.state = STATE_KEYEX
+        return True
 
-	def process_authn(self, message: dict) -> bool:
-		"""
-		Process messages related with the Authentication process
+    def process_keyex(self, message: dict) -> bool:
+        """
+        Process messages related with the Key Exchange process
 
-		:param message: The JSON object from the client
-		:return bool
-		"""
+        :param message: The JSON object from the client
+        :return bool
+        """
+        if self.state != STATE_KEYEX:
+            logger.warning("Invalid state. Discarding")
+            return False
+        logger.info("STATE: KEY_EXCHANGE")
 
-		if self.state != STATE_AUTHN:
-			logger.warning("Invalid state. Discarding")
-			return False
+        # do key exchange
 
-		logger.info("STATE: AUTHENTICATE")
+        # Primes
+        p = message['p']
+        g = message['g']
+        params_number = dh.DHParameterNumbers(p, g)
+        params = params_number.parameters(default_backend())
 
-		# do authenticate
+        # Private key
+        self.private_key = params.generate_private_key()
+        # Public key
+        self.public_key = self.private_key.public_key()
 
+        client_pub_key_bytes = base64.b64decode(message['public_key'])
+        client_pub_key = serialization.load_der_public_key(
+            client_pub_key_bytes, backend=default_backend())
 
-		self.send({'type': 'OK'})
-		# In the last message of this process advance the state
-		self.state = STATE_AUTHZ
-		return True
+        shared_key = self.private_key.exchange(client_pub_key)
 
-	def process_authz(self, message: dict) -> bool:
-		"""
-		Process messages related with the Authorization process
+        # Derivation
+        self.key = HKDF(algorithm=hashes.SHA256(), length=16, salt=os.urandom(16),
+                        info=b'key_derivation',
+                        backend=default_backend()
+                        ).derive(shared_key)
 
-		:param message: The JSON object from the client
-		:return bool
-		"""
+        server_pub_key_bytes = self.public_key.public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        msg = {"type": 'SERVER_PUBLIC_KEY',
+               'server_public_key': base64.b64encode(server_pub_key_bytes).decode('utf-8')}
 
-		if self.state != STATE_AUTHZ:
-			logger.warning("Invalid state. Discarding")
-			return False
+        self.send(msg)
+        # In the last message of this process advance the state
+        self.state = STATE_AUTHN
+        return True
 
-		logger.info("STATE: AUTHORIZE")
+    def process_authn(self, message: dict) -> bool:
+        """
+        Process messages related with the Authentication process
 
-		# do authorization
+        :param message: The JSON object from the client
+        :return bool
+        """
 
+        if self.state != STATE_AUTHN:
+            logger.warning("Invalid state. Discarding")
+            return False
 
-		self.send({'type': 'OK'})
-		# In the last message of this process advance the state
-		self.state = STATE_GET
-		return True
+        logger.info("STATE: AUTHENTICATE")
 
+        # do authenticate
+        self.server_nonce = base64.b64decode(message["nonce"])
 
-	def process_get(self, message: str) -> bool:
-		"""
-		Process messages related with the Data Transfer process
+        
 
-		:param message: The JSON object from the client
-		:return bool
-		"""
+        self.send({'type': 'OK'})
+        # In the last message of this process advance the state
+        self.state = STATE_AUTHZ
+        return True
 
-		# TODO: Função para enviar o arquivo para o cliente
-		if self.state != STATE_GET:
-			logger.warning("Invalid state. Discarding")
-			return False
+    def process_authz(self, message: dict) -> bool:
+        """
+        Process messages related with the Authorization process
 
-		logger.info("STATE: DATA TRANSFER")
+        :param message: The JSON object from the client
+        :return bool
+        """
 
-		if not 'file_name' in message:
-			logger.warning("No filename in Open")
-			return False
+        if self.state != STATE_AUTHZ:
+            logger.warning("Invalid state. Discarding")
+            return False
 
-		file_name = message.get('file_name')
-		file_path = os.path.join(storage_dir, file_name)
-		logger.info("Filename: {}".format(file_path))
+        logger.info("STATE: AUTHORIZE")
 
-		try:
-			file = open(file_path, "rb")
-			logger.info("File open")
-		except Exception:
-			logger.exception("Unable to open file")
-			return False
+        # do authorization
 
-		self.send({'type': 'OK'})
+        self.send({'type': 'OK'})
+        # In the last message of this process advance the state
+        self.state = STATE_GET
+        return True
 
-		payload = binascii.b2a_base64(file.read()).decode('ascii').strip()
-		print(payload)
+    def process_get(self, message: str) -> bool:
+        """
+        Process messages related with the Data Transfer process
 
-		data = {
-			'type': 'DATA',
-			'file_name': file_name,
-			'payload': payload
-			}
+        :param message: The JSON object from the client
+        :return bool
+        """
 
-		self.send(data)
-		file.close()
+        # TODO: Função para enviar o arquivo para o cliente
+        if self.state != STATE_GET:
+            logger.warning("Invalid state. Discarding")
+            return False
 
-		return True
+        logger.info("STATE: DATA TRANSFER")
 
-	def send(self, message: dict) -> None:
-		"""
-		Effectively encodes and sends a message
-		:param message:
-		:return:
-		"""
-		# TODO: NOTHING TO BE DONE HERE!
-		logger.debug("Send: {}".format(json.dumps(message, indent=4)))
-		self.send_obj(message)
+        if not 'file_name' in message:
+            logger.warning("No filename in Open")
+            return False
+
+        file_name = message.get('file_name')
+        file_path = os.path.join(storage_dir, file_name)
+        logger.info("Filename: {}".format(file_path))
+
+        try:
+            file = open(file_path, "rb")
+            logger.info("File open")
+        except Exception:
+            logger.exception("Unable to open file")
+            return False
+
+        self.send({'type': 'OK'})
+
+        payload = binascii.b2a_base64(file.read()).decode('ascii').strip()
+        print(payload)
+
+        data = {
+            'type': 'DATA',
+            'file_name': file_name,
+            'payload': payload
+        }
+
+        self.send(data)
+        file.close()
+
+        return True
+
+    def send(self, message: dict) -> None:
+        """
+        Effectively encodes and sends a message
+        :param message:
+        :return:
+        """
+        logger.debug("Send: {}".format(json.dumps(message, indent=4)))
+        msg = (json.dumps(message) + '\r\n').encode()
+        self._send(msg)
+
 
 def main():
-	global storage_dir
+    global storage_dir
 
-	parser = argparse.ArgumentParser(description='Sends files to clients.')
-	parser.add_argument('-v', action='count', dest='verbose',
-						help='Shows debug messages (default=False)',
-						default=0)
-	parser.add_argument('-p', type=int, action='store',
-						dest='port', default=5000,
-						help='TCP Port to use (default=5000)')
+    parser = argparse.ArgumentParser(description='Sends files to clients.')
+    parser.add_argument('-v', action='count', dest='verbose',
+                        help='Shows debug messages (default=False)',
+                        default=0)
+    parser.add_argument('-p', type=int, action='store',
+                        dest='port', default=5000,
+                        help='TCP Port to use (default=5000)')
 
-	parser.add_argument('-d', type=str, action='store', required=False, dest='storage_dir',
-						default='files',
-						help='Where get the files (default=./files)')
+    parser.add_argument('-d', type=str, action='store', required=False, dest='storage_dir',
+                        default='files',
+                        help='Where get the files (default=./files)')
 
-	args = parser.parse_args()
-	storage_dir = os.path.abspath(args.storage_dir)
-	level = logging.DEBUG if args.verbose > 0 else logging.INFO
-	port = args.port
+    args = parser.parse_args()
+    storage_dir = os.path.abspath(args.storage_dir)
+    level = logging.DEBUG if args.verbose > 0 else logging.INFO
+    port = args.port
 
-	if port <= 0 or port > 65535:
-		logger.error("Invalid port")
-		return
+    if port <= 0 or port > 65535:
+        logger.error("Invalid port")
+        return
 
-	if port < 1024 and not os.geteuid() == 0:
-		logger.error("Ports below 1024 require eUID=0 (root)")
-		return
+    if port < 1024 and not os.geteuid() == 0:
+        logger.error("Ports below 1024 require eUID=0 (root)")
+        return
 
-	coloredlogs.install(level)
-	logger.setLevel(level)
+    coloredlogs.install(level)
+    logger.setLevel(level)
 
-	logger.info("Starting.\n- Port: {}\n- LogLevel: {}\n- Storage: {}".format(port, level, storage_dir))
-	
-	jserver = jsocket.ServerFactory(ServerFactoryThread, address='0.0.0.0', port=port)
-	jserver.timeout = 2
-	jserver.start()
+    logger.info(
+        "Starting.\n- Port: {}\n- LogLevel: {}\n- Storage: {}".format(port, level, storage_dir))
+
+    jserver = jsocket.ServerFactory(
+        ServerFactoryThread, address='0.0.0.0', port=port)
+    jserver.timeout = 2
+    jserver.start()
+
 
 if __name__ == '__main__':
-	main()
-
-
+    main()
