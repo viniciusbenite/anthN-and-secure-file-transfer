@@ -49,6 +49,9 @@ class Client(jsocket.JsonClient):
 
         self.received_data = ""
 
+        self.rsa_pub_key = None
+        self.rsa_pri_key = None
+
     def do_connect(self):
         """
             Connect to server
@@ -59,24 +62,25 @@ class Client(jsocket.JsonClient):
         logger.debug("Trying to connect to server")
 
         self.send({"type": "CONNECT"})
-        data = self.read()
 
+        data = self.read()
+        logger.debug("CONNECT got -> {}".format(data))
         mtype = data.get('type', 'UNKNOWN')
+
         if mtype != 'CONNECT_OK':
             logger.debug("Connection failed!!")
             raise Exception("Error from server")
 
         # Do stuff
-
         self.state = STATE_AGREEMENT
         # TODO: negociar!
+        self.do_agreement()
 
     def do_agreement(self) -> None:
-        # TODO: Por agora, a negociação é aleatória
+
         self.algorithm = self.protocols.get('algorithms')[random.randint(0, 1)]
         self.mode = self.protocols.get('modes')[random.randint(0, 1)]
-        self.hash_function = self.protocols.get(
-            'hash_function')[random.randint(0, 1)]
+        self.hash_function = self.protocols.get('hash_functions')[random.randint(0, 1)]
 
         if self.algorithm == 'AES':
             self.iv = os.urandom(16)
@@ -90,6 +94,14 @@ class Client(jsocket.JsonClient):
 					'iv': base64.b64encode(self.iv).decode('utf-8')}
 
         self.send(msg)
+
+        # data = self.read()
+        # logger.debug("AGREEMENT got -> {}".format(data))
+        # mtype = data.get('type', 'UNKNOWN')
+
+        # if mtype != "AGREEMENT_OK":
+        #     raise Exception("Something went wrong in negotiation!!")
+
         self.state = STATE_KEYEX
 
     def do_keyexchange(self):
@@ -98,11 +110,6 @@ class Client(jsocket.JsonClient):
             Further communications may use the keys to secure all content
 
         """
-        data = self.read()
-
-        mtype = data.get('type', 'UNKNOWN')
-        if mtype != 'AGREEMENT_OK':
-            raise Exception("Error from server")
         logger.info("STATE: KEYEX")
 
 		# do key exchange
@@ -126,7 +133,15 @@ class Client(jsocket.JsonClient):
         'p': p,
         'g': g}
         self.send(msg)
+
+        data = self.read()
+        logger.debug("KEYEX got -> {}".format(data))
+        mtype = data.get('type', 'UNKNOWN')
+        if mtype != 'AGREEMENT_OK':
+            raise Exception("MSG != SERVER_PUBLIC_KEY")
+        
         # Advance state
+        logger.info("Advancing to STATE_AUTHN")
         self.state = STATE_AUTHN
 
     def do_authenticate(self) -> None:
@@ -134,35 +149,37 @@ class Client(jsocket.JsonClient):
             Send server an authentication request
             May need to obtain user credentials
         """
-        #TODO: isso vai dar pau. To bad!
-        data = self.read()
-
         logger.info("Begining authn process")
-        decod_server_pub_key = base64.b64decode(data['server_public_key'])
+
+        d = self.read()
+        logger.debug("READ")
+
+        decod_server_pub_key = base64.b64decode(d['server_public_key'])
         server_pub_key = serialization.load_der_public_key(decod_server_pub_key, backend=default_backend())
         shared_key = self.private_key.exchange(server_pub_key)
 
         # Derivation
         self.key = HKDF(algorithm=hashes.SHA256(),
         length=16,
-        salt=os.urandom(16),
+        salt=None,
         info=b'derivation',
         backend=default_backend()).derive(shared_key)
 
         # Send request
         self.server_nonce = os.urandom(16)
-        text = str.encode(json.dumps({ "type": 'AUTHN', "nonce": base64.b64encode(self.server_nonce).decode('utf-8')}))
+        text = str.encode(json.dumps({ "type": 'AUTHN', "nonce": base64.b64encode(self.server_nonce).decode('utf-8') }))
         payload, mac = self.encrypt(text)
-        msg = { "type": 'SECURE', "payload": base64.b64encode(payload).decode('utf-8'),
-        "HMAC": base64.b64encode(mac).decode('utf-8')}
+        msg = { "type": 'SECURE', "payload": base64.b64encode(payload).decode('utf-8'), "h_mac": base64.b64encode(mac).decode('utf-8') }
         self.send(msg)
 
+        data = self.read()
+        logger.debug("AUTHN got -> {}".format(data))
         mtype = data.get('type', 'UNKNOWN')
-        if mtype != 'OK':
-            raise Exception("Error from server")
+        if mtype != 'AUTHN_OK': # N TÁ DECRIPITANDO A MSG
+            raise Exception("MSG != AUTHN_OK")
 
+        logger.info("AUTHENTICATION_OK")
         self.state = STATE_AUTHZ
-        # Do stuff
 
     def do_authorize(self) -> None:
         """
@@ -212,29 +229,39 @@ class Client(jsocket.JsonClient):
             :param message: The message to send
 
         """
-
-        logger.debug("Send: {}".format(message))
-
+        try:
+            logger.debug("Send: {}".format(message))
+        except Exception as e:
+            logger.exception("Exception -> {}".format(e))
         # Encrypt, adapt, etc...
-        msg = (json.dumps(message) + '\r\n').encode()
-        return self._send(msg)
+        msg = (json.dumps(message, indent=4))
+        self.send_obj(msg)
 
     def read(self) -> dict:
         """
             Reads a message from the server
             :param message: Waits for a message from the server
         """
-
-        data = self.read_obj()
-        logger.debug("Got: {}".format(data))
-        
+        logger.debug("Incoming msg!!")
+        try:
+            data = self.read_obj()
+            dec_data = json.loads(data)
+            if dec_data['type'] == 'SECURE':
+                logger.debug("We got a secure msg")
+                payload = base64.b64decode(dec_data['payload']) # Bytes
+                h_mac = base64.b64decode(dec_data['mac'])
+                d = self.decrypt(payload, h_mac, dec_data)
+                final_data = json.loads(d)
+                return final_data
+        except Exception as e:
+            logger.exception("WTF is going on? -> {}".format(e))
         # Decrypt, filter, etc..
 
-        mtype = data.get('type', 'UNKNOWN')
+        mtype = dec_data.get('type', 'UNKNOWN')
         if mtype == 'ERROR':
             raise Exception("Error from server")
 
-        return data
+        return dec_data
 
     def encrypt(self, message: dict) -> dict:
         """
@@ -276,12 +303,14 @@ class Client(jsocket.JsonClient):
         h = hmac.HMAC(self.key, sintese, backend=default_backend())
         h.update(text)
         h_mac = h.finalize()
-        # TODO: check this
-        payload = text, h_mac
-        message = {'type': 'SECURE', 'payload': payload}
-        return message
 
-    def decrypt(self, message: dict) -> dict:
+        # TODO: check this
+
+        # message = {'type': 'SECURE', 'payload': payload}
+
+        return text, h_mac
+
+    def decrypt(self, text, mac, message: dict) -> dict:
         """
             Decrypts a message
         
@@ -295,8 +324,8 @@ class Client(jsocket.JsonClient):
 
         cipher = None
         block_size = 0
-        payload = message.get('payload')
-        text, h_mac = payload
+        #payload = message.get('payload')
+        #text, h_mac = payload
         # TODO: duplicação de código. CHECK THIS
         # Algorithm
         if self.algorithm == 'AES':
@@ -324,7 +353,7 @@ class Client(jsocket.JsonClient):
         unpadder = padding.PKCS7(block_size).unpadder()
         h = hmac.HMAC(self.key, sintese, backend=default_backend())
         h.update(text)
-        h.verify(h_mac)
+        h.verify(mac)
         p_data = decryptor.update(text) + decryptor.finalize()
         data = unpadder.update(p_data) + unpadder.finalize()
         final_data = base64.b64decode(data)
@@ -349,7 +378,9 @@ class Client(jsocket.JsonClient):
 
         return message
 
-
+    # Auxiliar functions
+    def password_validation(self):
+        pass
 def main():
     parser = argparse.ArgumentParser(description='Gets files from servers.')
     parser.add_argument('-v', action='count', dest='verbose',
@@ -381,7 +412,7 @@ def main():
         client.do_authorize()
         logger.info("Connected")
     except:
-        logger.exception("Server connect")
+        logger.exception("Server disconnect")
         return
 
     try:

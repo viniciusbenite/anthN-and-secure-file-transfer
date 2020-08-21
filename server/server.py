@@ -10,6 +10,7 @@ import os
 import random
 import string
 import re
+import errno, time, socket
 import cryptography.hazmat.primitives.serialization as serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -70,6 +71,13 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         self.private_key = None
         self.public_key = None
 
+        self.sv_crt_pub_key = None
+        self.sv_crt_pri_key = None
+
+        self.rsa_client_pub_key = None
+        self.rsa_server_pub_key = None
+        self.rsa_server_pri_hey = None
+
     def _process_message(self, message: dict) -> None:
         """
         Called when a frame (JSON Object) is extracted
@@ -80,8 +88,8 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         try:
             logger.debug("Process Message. Object: {}".format(message))
             self.process_client_message(eval(str(message)))
-        except:
-            logger.exception("process_message")
+        except Exception as e:
+            logger.exception("process_message error: {}".format(e))
 
     def process_client_message(self, message: dict) -> None:
         """
@@ -94,10 +102,6 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 
         ret = False
 
-        if mtype == 'SECURE':
-            #TODO pass for now
-            # message = self.process_secure(message)
-            pass
         if message is not None:
             mtype = message.get('type', "").upper()
             if mtype == 'CONNECT':
@@ -106,15 +110,24 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
                 ret = self.process_agreement(message)
             elif mtype == 'KEYEX':
                 ret = self.process_keyex(message)
-            elif mtype == 'AUTHN':
-                ret = self.process_authn(message)
-            elif mtype == 'AUTHZ':
-                ret = self.process_authz(message)
-            elif mtype == 'GET':
-                ret = self.process_get(message)
-            else:
-                logger.warning(
-                    "Invalid message type: {}".format(message['type']))
+            
+            if mtype == 'SECURE':
+                payload = base64.b64decode(message['payload']) # Bytes
+                h_mac = base64.b64decode(message['h_mac'])
+                data = self.decrypt(payload, h_mac, message)
+                dec_msg = json.loads(data)
+                #TODO ok? no
+                logger.debug("Decrypted msg: {}".format(dec_msg))
+                mtype = dec_msg.get('type', '')
+                if mtype == 'AUTHN':
+                    ret = self.process_authn(dec_msg)
+                elif mtype == 'AUTHZ':
+                    ret = self.process_authz(message)
+                elif mtype == 'GET':
+                    ret = self.process_get(message)
+                else:
+                    logger.warning(
+                        "Invalid message type: {}".format(message['type']))
 
         if not ret:
             try:
@@ -126,7 +139,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
             logger.info("Closing connection")
 
             self.state = STATE_CONNECT
-            self.close()
+           # self.close()
 
     def process_connect(self, message: dict) -> bool:
         """
@@ -139,7 +152,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
             return False
         logger.info("STATE: CONNECT")
 
-        # Do Stuff
+        # Do Stuff ???????
 
         self.send({'type': 'CONNECT_OK'})
         logger.info("ADVANCING STATE")
@@ -175,9 +188,9 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         logger.info(
             f'Algorithm: {self.algorithm}, Mode: {self.mode}, Hash function: {self.hash_function}, IV:{self.iv}')
         message = {'type': 'AGREEMENT_OK'}
-        self._send(message)
+        self.send(message)
         # Advance state
-        logger.info("ADVANCING STATE")
+        logger.info("ADVANCING TO STATE_KEYEX")
         self.state = STATE_KEYEX
         return True
 
@@ -213,8 +226,8 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         shared_key = self.private_key.exchange(client_pub_key)
 
         # Derivation
-        self.key = HKDF(algorithm=hashes.SHA256(), length=16, salt=os.urandom(16),
-                        info=b'key_derivation',
+        self.key = HKDF(algorithm=hashes.SHA256(), length=16, salt=None,
+                        info=b'derivation',
                         backend=default_backend()
                         ).derive(shared_key)
 
@@ -225,7 +238,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 
         self.send(msg)
         # In the last message of this process advance the state
-        logger.info("ADVANCING STATE")
+        logger.info("ADVANCING TO STATE_AUTHN")
         self.state = STATE_AUTHN
         return True
 
@@ -244,32 +257,34 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         logger.info("STATE: AUTHENTICATE")
 
         # do authenticate
-        self.server_nonce = base64.b64decode(message["nonce"])
+        logger.debug("Got: {}".format(message))
+        self.server_nonce = base64.b64decode(message['nonce'])
         # TODO: check pass.... ok
         # Load server pri_key
-        with open("./sv-keys/key.pem") as k:
-            self.sv_key = serialization.load_pem_private_key(k.read(), password=None, backend=default_backend())
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/sv-key.pem", "rb") as k: 
+            self.sv_crt_pri_key = serialization.load_pem_private_key(k.read(), password=None, backend=default_backend())
 
         # Get pub_key
+        self.sv_crt_pub_key = self.sv_crt_pri_key.public_key()
+    
         hs = hashes.Hash(hashes.SHA256(), backend=default_backend())
         hs.update(self.server_nonce)
         digested_hash = hs.finalize()
 
-        nonce = self.sv_key.sign(digested_hash,
-        padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
+        nonce = self.sv_crt_pri_key.sign(digested_hash, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
 
         # sv certificate
-        with open("./sv-keys/rootCA.crt") as s:
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/server.crt", "rb") as s: 
             self.sv_crt = x509.load_pem_x509_certificate(s.read(), backend=default_backend())
         b_sv_cert = self.sv_crt.public_bytes(serialization.Encoding.DER)
 
         # Send all to client
-        text = str.encode(json.dumps( { "type": "AUTHN_OK", "nonce": base64.b64encode(nonce).decode("utf-8") }))
+        text = str.encode(json.dumps( { "type": "AUTHN_OK", "nonce": base64.b64encode(nonce).decode("utf-8"), "sv_cert": base64.b64encode(b_sv_cert).decode('utf-8') }))
         payload, mac = self.encrypt(text)
         msg = {"type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "mac": base64.b64encode(mac).decode("utf-8")}
 
         self.send(msg)
-        
+        logger.info("CERETIFICATE SENDED")
         # In the last message of this process advance the state
         logger.info("ADVANCING STATE")
         self.state = STATE_AUTHZ
@@ -349,8 +364,11 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         :return:
         """
         logger.debug("Send: {}".format(json.dumps(message, indent=4)))
-        msg = (json.dumps(message) + '\r\n').encode()
-        self._send(msg)
+        try:
+            self.send_obj(json.dumps(message, indent=4))
+            time.sleep(1)
+        except Exception as e:
+            logger.exception("Excpetion -> {}".format(e))
 
     #TODO: codigo duplicado. ohh no!
     def encrypt(self, message: dict) -> dict:
@@ -394,10 +412,60 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         h.update(text)
         h_mac = h.finalize()
         # TODO: check this
-        payload = text, h_mac
-        message = {'type': 'SECURE', 'payload': payload}
 
-        return message
+        return text, h_mac
+
+    def decrypt(self, text, mac, message: dict) -> dict:
+        """
+            Decrypts a message
+        
+            :param message: Message to encrypt
+        """
+        mtype = message.get('type', '')
+
+        if mtype != "SECURE":
+            logger.error("Cannot decrypt message")
+            raise Exception("Cannot decrypt message")
+
+        cipher = None
+        block_size = 0
+        # payload = message.get('payload')
+        logger.debug("Got payload: {}".format(text))
+
+        # TODO: duplicação de código. CHECK THIS
+        # Algorithm
+        if self.algorithm == 'AES':
+            alg = algorithms.AES(self.key)
+            block_size = alg.block_size
+        elif self.algorithm == '3DES':
+            alg = algorithms.TripleDES(self.key)
+            block_size = alg.block_size
+
+        # Mode
+        if self.mode == 'ECB':
+            modo = modes.ECB()
+        elif self.mode == 'CBC':
+            modo = modes.CBC(self.iv)
+        cipher = Cipher(alg, modo, backend=default_backend())
+
+        # Synthesis
+        if self.hash_function == 'SHA-256':
+            sintese = hashes.SHA256()
+        elif self.hash_function == 'MD5':
+            sintese = hashes.MD5()
+
+        # Decrypt msg
+        decryptor = cipher.decryptor()
+        unpadder = padding.PKCS7(block_size).unpadder()
+        h = hmac.HMAC(self.key, sintese, backend=default_backend())
+        h.update(text)
+        # TODO Invalid signature. Fixed: salt diferentes...
+        h.verify(mac)
+        p_data = decryptor.update(text) + decryptor.finalize()
+        data = unpadder.update(p_data) + unpadder.finalize()
+        final_data = base64.b64decode(data)
+
+        return final_data
 
 
 def main():
@@ -436,7 +504,7 @@ def main():
 
     jserver = jsocket.ServerFactory(
         ServerFactoryThread, address='0.0.0.0', port=port)
-    jserver.timeout = 2
+    jserver.timeout = 99999
     jserver.start()
 
 
