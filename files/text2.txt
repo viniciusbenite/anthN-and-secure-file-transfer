@@ -1,0 +1,25 @@
+
+class cryptography.exceptions.UnsupportedAlgorithm[source]
+
+    Raised when the requested algorithm, or combination of algorithms is not supported.
+
+class cryptography.exceptions.AlreadyFinalized[source]
+
+    This is raised when a context is used after being finalized.
+
+class cryptography.exceptions.InvalidSignature[source]
+
+    This is raised when signature verification fails. This can occur with HMAC or asymmetric key signature validation.
+
+class cryptography.exceptions.NotYetFinalized[source]
+
+    This is raised when the AEAD tag property is accessed on a context before it is finalized.
+
+class cryptography.exceptions.AlreadyUpdated[source]
+
+    This is raised when additional data is added to a context after update has already been called.
+
+class cryptography.exceptions.InvalidKey[source]
+
+    This is raised when the verify method of a key derivation function’s computed key does not match the expected key.
+

@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives import hashes, hmac, padding
 from cryptography.hazmat.primitives.asymmetric import dh, rsa
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.asymmetric import utils
-from cryptography.hazmat.primitives.asymmetric import padding as pdr
+from cryptography.hazmat.primitives.asymmetric import padding as padder
 from cryptography import x509
 
 logger = logging.getLogger('jclient')
@@ -30,8 +30,10 @@ STATE_AGREEMENT = 5
 
 
 class Client(jsocket.JsonClient):
-    def __init__(self, address="127.0.0.1", port=5000):
+    def __init__(self, auth_mode, address="127.0.0.1", port=5000):
         super(Client, self).__init__(address, port)
+
+        self.auth_mode = auth_mode
 
         self.algorithm = None
         self.mode = None
@@ -46,21 +48,21 @@ class Client(jsocket.JsonClient):
         self.key = None
         self.private_key = None
         self.public_key = None
-
-        self.received_data = ""
+        
+        self.sv_crt_pub_key = None
 
         self.rsa_pub_key = None
         self.rsa_pri_key = None
 
     def do_connect(self):
         """
-            Connect to server
-
+            Function to connect to server. After successfull conection, start
+            algorithms agreement and key exchange.
         """
 
         self.connect()
         logger.debug("Trying to connect to server")
-
+        logger.debug("Mode {}".format(self.mode))
         self.send({"type": "CONNECT"})
 
         data = self.read()
@@ -77,6 +79,10 @@ class Client(jsocket.JsonClient):
         self.do_agreement()
 
     def do_agreement(self) -> None:
+        """
+            Function to define algorithms, hash functions and modes.
+            Those are defined randomly.
+        """
 
         self.algorithm = self.protocols.get('algorithms')[random.randint(0, 1)]
         self.mode = self.protocols.get('modes')[random.randint(0, 1)]
@@ -94,13 +100,6 @@ class Client(jsocket.JsonClient):
 					'iv': base64.b64encode(self.iv).decode('utf-8')}
 
         self.send(msg)
-
-        # data = self.read()
-        # logger.debug("AGREEMENT got -> {}".format(data))
-        # mtype = data.get('type', 'UNKNOWN')
-
-        # if mtype != "AGREEMENT_OK":
-        #     raise Exception("Something went wrong in negotiation!!")
 
         self.state = STATE_KEYEX
 
@@ -148,14 +147,15 @@ class Client(jsocket.JsonClient):
         """
             Send server an authentication request
             May need to obtain user credentials
+            User may choose authenticate by password or CC
         """
         logger.info("Begining authn process")
 
+        # Gen key
         d = self.read()
-        logger.debug("READ")
 
-        decod_server_pub_key = base64.b64decode(d['server_public_key'])
-        server_pub_key = serialization.load_der_public_key(decod_server_pub_key, backend=default_backend())
+        b_server_pub_key = base64.b64decode(d['server_public_key'])
+        server_pub_key = serialization.load_der_public_key(b_server_pub_key, backend=default_backend())
         shared_key = self.private_key.exchange(server_pub_key)
 
         # Derivation
@@ -167,18 +167,61 @@ class Client(jsocket.JsonClient):
 
         # Send request
         self.server_nonce = os.urandom(16)
-        text = str.encode(json.dumps({ "type": 'AUTHN', "nonce": base64.b64encode(self.server_nonce).decode('utf-8') }))
+        text = str.encode(json.dumps({ "type": 'AUTHN_REQ', "nonce": base64.b64encode(self.server_nonce).decode('utf-8') }))
         payload, mac = self.encrypt(text)
         msg = { "type": 'SECURE', "payload": base64.b64encode(payload).decode('utf-8'), "h_mac": base64.b64encode(mac).decode('utf-8') }
         self.send(msg)
 
+        # Authenticate server
         data = self.read()
-        logger.debug("AUTHN got -> {}".format(data))
+        logger.debug("KEY_GEN got -> {}".format(data))
         mtype = data.get('type', 'UNKNOWN')
-        if mtype != 'AUTHN_OK': # N TÁ DECRIPITANDO A MSG
-            raise Exception("MSG != AUTHN_OK")
+        if mtype != 'KEY_GEN_OK':
+            raise Exception("Something went wrong in key gen")
 
-        logger.info("AUTHENTICATION_OK")
+        
+        sv_nonce = base64.b64decode(data["nonce"])
+        b_sv_crt = base64.b64decode(data["sv_cert"])
+        self.sv_crt = x509.load_der_x509_certificate(b_sv_crt, backend=default_backend())
+
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/rootCA.crt", "rb") as f:
+            data = f.read()
+            self.rootCA_crt = x509.load_pem_x509_certificate(data, backend=default_backend())
+
+        self.sv_crt_pub_key = self.sv_crt.public_key()
+        self.rootCA_crt_pub_key = self.rootCA_crt.public_key()
+
+        hs = hashes.Hash(hashes.SHA256(), backend=default_backend())
+        hs.update(self.server_nonce)
+        digest = hs.finalize()
+
+        try:
+            self.sv_crt_pub_key.verify(sv_nonce, digest, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
+            logger.info("Server authenticated")
+        except Exception as e:
+            #TODO fix this shit
+            logger.exception("Invalid signature {}".format(e))
+            
+        #TODO VALIDATE SERVER CHAIN
+
+        if self.auth_mode == "pass":
+                self.password_validation_request()
+        elif self.auth_mode == "cc":
+                # self.cc_validation_request()
+                pass
+        else:
+            self.send({ "type": "ERROR" })
+            raise Exception("Authentication mode not suported")
+
+        # Check if authentication went ok
+        p_reply = self.read()
+        logger.info(p_reply)
+        logger.debug("AUTHN got -> {}".format(p_reply))
+        mtype = p_reply.get('type', 'UNKNOWN')
+        if mtype != 'AUTHN_OK':
+            raise Exception("Authentication fail!!")
+
+        logger.info("Advancing state")
         self.state = STATE_AUTHZ
 
     def do_authorize(self) -> None:
@@ -186,15 +229,18 @@ class Client(jsocket.JsonClient):
             Send server an authorization request
 
         """
-
-        self.send({"type": "AUTHZ"})
+        text = str.encode(json.dumps( { "type": "AUTHZ_REQ", "user": self.user }))
+        payload, mac = self.encrypt(text)
+        msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
+        self.send(msg)
+        
         data = self.read()
-
+        logger.debug("AUTHZ got -> {}".format(data))
         mtype = data.get('type', 'UNKNOWN')
-        if mtype != 'OK':
-            raise Exception("Error from server")
-
-        # Do stuff
+        if mtype != 'GET_OK':
+            raise Exception("Authorization failed")
+        logger.info("Advancing state")
+        self.state = STATE_GET
 
     def get_file(self, file_name: str) -> None:
         """
@@ -202,16 +248,23 @@ class Client(jsocket.JsonClient):
 
             :param file_name: The name of the file to get
         """
-        self.send({"type": "GET", "file_name": file_name})
+        text = str.encode(json.dumps( { "type": "FILE_REQ", "file_name": file_name }))
+        #TODO codigo dupli.. refactor!
+        payload, mac = self.encrypt(text)
+        msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
+        self.send(msg)
+
         data = self.read()
 
         mtype = data.get('type', 'UNKNOWN')
-        if mtype != 'OK':
+        logger.debug("GET FILE GOT -> {}".format(data))
+        if mtype != 'DOWNLOAD_OK':
             raise Exception("Error from server")
 
         data = self.read()
 
         mtype = data.get('type', 'UNKNOWN')
+        logger.debug("GET FILE GOT -> {}".format(data))
         if mtype != 'DATA':
             raise Exception("Error from server")
 
@@ -242,26 +295,26 @@ class Client(jsocket.JsonClient):
             Reads a message from the server
             :param message: Waits for a message from the server
         """
-        logger.debug("Incoming msg!!")
         try:
             data = self.read_obj()
-            dec_data = json.loads(data)
-            if dec_data['type'] == 'SECURE':
+            d = json.loads(data)
+            if d['type'] == 'SECURE':
                 logger.debug("We got a secure msg")
-                payload = base64.b64decode(dec_data['payload']) # Bytes
-                h_mac = base64.b64decode(dec_data['mac'])
-                d = self.decrypt(payload, h_mac, dec_data)
-                final_data = json.loads(d)
-                return final_data
+                payload = base64.b64decode(d['payload']) # Bytes
+                h_mac = base64.b64decode(d['h_mac'])
+                dd = self.decrypt(payload, h_mac, d)
+                dec_data = json.loads(dd)
+                return dec_data
         except Exception as e:
             logger.exception("WTF is going on? -> {}".format(e))
         # Decrypt, filter, etc..
 
-        mtype = dec_data.get('type', 'UNKNOWN')
+        mtype = d.get('type', 'UNKNOWN')
         if mtype == 'ERROR':
-            raise Exception("Error from server")
+            logger.exception(d.get("payload"))
+            raise Exception(d.get('payload'))
 
-        return dec_data
+        return d
 
     def encrypt(self, message: dict) -> dict:
         """
@@ -379,8 +432,47 @@ class Client(jsocket.JsonClient):
         return message
 
     # Auxiliar functions
-    def password_validation(self):
-        pass
+    def password_validation_request(self):
+        """
+            Function to send a password chalange request to server.
+        """
+        logger.info("REQUESTING PASSWORD CHALANGE")
+        self.rsa_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+        self.rsa_pub_key = self.rsa_pri_key.public_key()
+        b_rsa_pub_key = self.rsa_pub_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        text = str.encode(json.dumps({ "type": "PWD_CHALANGE_REQ", "RSA_PUB_KEY": base64.b64encode(b_rsa_pub_key).decode("utf-8") }))
+        payload, mac = self.encrypt(text)
+        msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
+        self.send(msg)
+
+        try:
+            reply = self.read()
+            mtype = reply.get("type")
+            if mtype == "CHALANGE_PASS":
+                self.password_validation_reply(reply)
+        except Exception as e:
+            logger.exception("Something went wrong ... {}".format(e))
+
+    def password_validation_reply(self, message: str) -> None:
+        """
+            Function to reply to the chalange sended by the server.
+            :param message: the chalange sended by server
+        """
+        logger.info("REPLYING PASSWORD CHALANGE")
+        self.chalange_nonce = base64.b64decode(message["nonce"])
+        self.user = input("Type you name: ")
+        pwd = input("Type your password: ")
+        p = pwd.encode() + self.chalange_nonce
+        hs = hashes.Hash(hashes.SHA256(), backend=default_backend())
+        hs.update(p)
+        digest = hs.finalize()
+        pass_signed = self.rsa_pri_key.sign(digest, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
+        text = str.encode(json.dumps( { "type": "CHALANGE_PWD_REP", "user": self.user, "password": base64.b64encode(pass_signed).decode("utf-8") }))
+        payload, mac = self.encrypt(text)
+        msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
+        self.send(msg)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Gets files from servers.')
     parser.add_argument('-v', action='count', dest='verbose',
@@ -393,19 +485,21 @@ def main():
                         help='Server port (default=5000)')
 
     parser.add_argument(type=str, dest='file_name', help='File to get')
+    parser.add_argument('-m', dest='auth_mode', help="Choose the authN method(pass or cc) ")
 
     args = parser.parse_args()
     file_name = args.file_name
     level = logging.DEBUG if args.verbose > 0 else logging.INFO
     port = args.port
     server = args.server
+    auth_mode = args.auth_mode
 
     coloredlogs.install(level)
     logger.setLevel(level)
 
     try:
         logger.info("Connecting to server.\n- Address: {}\n- Port: {}".format(server, port))
-        client = Client(address=server, port=port)
+        client = Client(auth_mode=auth_mode, address=server, port=port)
         client.do_connect()
         client.do_keyexchange()
         client.do_authenticate()

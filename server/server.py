@@ -33,16 +33,25 @@ STATE_AUTHN = 3  # AUTHeNtication
 STATE_AUTHZ = 3  # AUTHoriZation
 STATE_GET = 4  # Data Transfer
 STATE_AGREEMENT = 5 # Negotiation phase
+STATE_CHALANGE = 6
 
 # GLOBAL
 backend = default_backend()
 
-user_list = {'username_a':
+user_list = {'vinicius':
              {
-                 'fullname': 'User Name A',
+                 'fullname': 'vinicius ribeiro',
                  'certificate': '',
+                 "password": "vinicius",
                  'can_connect': True,
                  'can_read': False
+             },
+             'taynara': {
+                 'fullname': 'taynara araujo',
+                 'certificate': '',
+                 "password": "taynara",
+                 'can_connect': True,
+                 'can_read': True
              }
              }
 
@@ -116,15 +125,19 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
                 h_mac = base64.b64decode(message['h_mac'])
                 data = self.decrypt(payload, h_mac, message)
                 dec_msg = json.loads(data)
-                #TODO ok? no
-                logger.debug("Decrypted msg: {}".format(dec_msg))
                 mtype = dec_msg.get('type', '')
-                if mtype == 'AUTHN':
+                if mtype == 'AUTHN_REQ':
                     ret = self.process_authn(dec_msg)
-                elif mtype == 'AUTHZ':
-                    ret = self.process_authz(message)
-                elif mtype == 'GET':
-                    ret = self.process_get(message)
+                elif mtype == "PWD_CHALANGE_REQ":
+                    self.send_chalange_pass(dec_msg)
+                    ret = True
+                elif mtype == "CHALANGE_PWD_REP":
+                    self.process_chalange_pass(dec_msg)
+                    ret = True
+                elif mtype == "AUTHZ_REQ":
+                    ret = self.process_authz(dec_msg)
+                elif mtype == 'FILE_REQ':
+                    ret = self.process_get(dec_msg)
                 else:
                     logger.warning(
                         "Invalid message type: {}".format(message['type']))
@@ -251,7 +264,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         """
 
         if self.state != STATE_AUTHN:
-            logger.warning("Invalid state. Discarding")
+            logger.warning("Invalid state (AUTHN). Discarding")
             return False
 
         logger.info("STATE: AUTHENTICATE")
@@ -261,8 +274,9 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         self.server_nonce = base64.b64decode(message['nonce'])
         # TODO: check pass.... ok
         # Load server pri_key
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/sv-key.pem", "rb") as k: 
-            self.sv_crt_pri_key = serialization.load_pem_private_key(k.read(), password=None, backend=default_backend())
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/sv-key.pem", "rb") as f: 
+            data = f.read()
+            self.sv_crt_pri_key = serialization.load_pem_private_key(data, password=None, backend=default_backend())
 
         # Get pub_key
         self.sv_crt_pub_key = self.sv_crt_pri_key.public_key()
@@ -274,20 +288,24 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         nonce = self.sv_crt_pri_key.sign(digested_hash, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
 
         # sv certificate
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/server.crt", "rb") as s: 
-            self.sv_crt = x509.load_pem_x509_certificate(s.read(), backend=default_backend())
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/server.crt", "rb") as f: 
+            data = f.read()
+            self.sv_crt = x509.load_pem_x509_certificate(data, backend=default_backend())
         b_sv_cert = self.sv_crt.public_bytes(serialization.Encoding.DER)
 
         # Send all to client
-        text = str.encode(json.dumps( { "type": "AUTHN_OK", "nonce": base64.b64encode(nonce).decode("utf-8"), "sv_cert": base64.b64encode(b_sv_cert).decode('utf-8') }))
+        text = str.encode(json.dumps( { "type": "KEY_GEN_OK", "nonce": base64.b64encode(nonce).decode("utf-8"), "sv_cert": base64.b64encode(b_sv_cert).decode('utf-8') }))
+        # Encrypted message
         payload, mac = self.encrypt(text)
-        msg = {"type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "mac": base64.b64encode(mac).decode("utf-8")}
+        msg = {"type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8")}
 
         self.send(msg)
         logger.info("CERETIFICATE SENDED")
+
+        # Chalange request #
         # In the last message of this process advance the state
         logger.info("ADVANCING STATE")
-        self.state = STATE_AUTHZ
+        self.state = STATE_CHALANGE
         return True
 
     def process_authz(self, message: dict) -> bool:
@@ -303,11 +321,16 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
             return False
 
         logger.info("STATE: AUTHORIZE")
+        user = message['user']
 
         # do authorization
-
-        self.send({'type': 'OK'})
+        if user_list.get(user).get("can_read") is False:
+            self.send({ "type": "ERROR", "payload": "User can't download files" })
+            raise Exception("User can not download files from server")
+        logger.info("USER IS AUTHORIZED TO DOWNLOAD FILES")
+        self.send({'type': 'GET_OK', "payload": "AUTHZ_OK"})
         # In the last message of this process advance the state
+        logger.debug("ADVANCING TO GET STATE")
         self.state = STATE_GET
         return True
 
@@ -318,19 +341,17 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         :param message: The JSON object from the client
         :return bool
         """
-
-        # TODO: Função para enviar o arquivo para o cliente
         if self.state != STATE_GET:
             logger.warning("Invalid state. Discarding")
             return False
 
         logger.info("STATE: DATA TRANSFER")
-
         if not 'file_name' in message:
             logger.warning("No filename in Open")
             return False
 
         file_name = message.get('file_name')
+        logger.info("FILE NAME -> {}".format(file_name))
         file_path = os.path.join(storage_dir, file_name)
         logger.info("Filename: {}".format(file_path))
 
@@ -341,22 +362,24 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
             logger.exception("Unable to open file")
             return False
 
-        self.send({'type': 'OK'})
+        self.send( {'type': 'DOWNLOAD_OK'} )
 
         payload = binascii.b2a_base64(file.read()).decode('ascii').strip()
-        print(payload)
+        logger.info("Payload: {}".format(payload))
 
-        data = {
+        data = str.encode(json.dumps({
             'type': 'DATA',
             'file_name': file_name,
             'payload': payload
-        }
-
-        self.send(data)
+        }))
+        payload, mac = self.encrypt(data)
+        msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
+        self.send(msg)
         file.close()
 
         return True
 
+    # Auxiliar functions. Jogar pra outro arquivo
     def send(self, message: dict) -> None:
         """
         Effectively encodes and sends a message
@@ -366,11 +389,10 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         logger.debug("Send: {}".format(json.dumps(message, indent=4)))
         try:
             self.send_obj(json.dumps(message, indent=4))
-            time.sleep(1)
         except Exception as e:
             logger.exception("Excpetion -> {}".format(e))
 
-    #TODO: codigo duplicado. ohh no!
+    #TODO: codigo duplicado. ohh no, too bad!
     def encrypt(self, message: dict) -> dict:
         """
             Encrypt a message
@@ -466,6 +488,51 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         final_data = base64.b64decode(data)
 
         return final_data
+
+    def send_chalange_pass(self, message: str) -> None:
+        """
+            Send a password chalange to the client
+            :param message: chalange request from client
+        """
+        if self.state != STATE_CHALANGE:
+            logger.warning("Invalid state (CHALANGE). Discarding")
+            raise Exception("Something went wront while sending chalange pass")
+        logger.info("SENDING CHALANGE PASSWORD")
+        b_rsa_client_pub_key = base64.b64decode(message['RSA_PUB_KEY'])
+        self.rsa_client_pub_key = serialization.load_der_public_key(b_rsa_client_pub_key, backend=default_backend())
+        self.chalenge_nonce = os.urandom(16)
+        text = str.encode(json.dumps({ "type": 'CHALANGE_PASS', "nonce": base64.b64encode(self.chalenge_nonce).decode("utf-8") }))
+        payload, mac = self.encrypt(text)
+        msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
+        self.send(msg)
+
+    def process_chalange_pass(self, message: str) -> None:
+        """
+            Verify if the chalange reply is corrent
+            :param message: chalange reply from client
+        """
+        if self.state != STATE_CHALANGE:
+            logger.warning("Invalid state (CHALANGE). Discarding")
+            raise Exception("WRONG STATE!!")
+        logger.info("PROCESSING CHALANGE PASSWORD")
+        self.user = message["user"]
+        self.pwd = base64.b64decode(message["password"])
+        if self.user not in user_list.keys():
+            self.send( { "type": "ERROR", "payload": "Wrong username/password" } )
+            raise Exception("Something went wrong. Check your user/pass")
+        else:
+            password = user_list.get(self.user).get("password").encode() + self.chalenge_nonce
+            hs = hashes.Hash(hashes.SHA256(), backend=default_backend())
+            hs.update(password)
+            digest = hs.finalize()
+            try:
+                self.rsa_client_pub_key.verify(self.pwd, digest, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
+                self.send({ "type": "AUTHN_OK" })
+                logger.info("User {} authenticated".format(self.user))
+                self.state = STATE_AUTHN
+            except Exception as e:
+                logger.info("Something went wrong... {}".format(e))
+                self.send({ "type": "ERROR", "payload": "Invalid signature" })
 
 
 def main():
