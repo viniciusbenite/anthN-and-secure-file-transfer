@@ -33,7 +33,7 @@ class Client(jsocket.JsonClient):
     def __init__(self, auth_mode, address="127.0.0.1", port=5000):
         super(Client, self).__init__(address, port)
 
-        self.auth_mode = auth_mode
+        self.auth_mode = auth_mode # Pass or CC
 
         self.algorithm = None
         self.mode = None
@@ -75,7 +75,7 @@ class Client(jsocket.JsonClient):
 
         # Do stuff
         self.state = STATE_AGREEMENT
-        # TODO: negociar!
+        # negociar!
         self.do_agreement()
 
     def do_agreement(self) -> None:
@@ -274,8 +274,6 @@ class Client(jsocket.JsonClient):
         with open(file_name, "wb") as f:
             f.write(payload)
 
-        # Do stuff
-
     def send(self, message: dict) -> None:
         """
             Sends a message to the server
@@ -286,7 +284,6 @@ class Client(jsocket.JsonClient):
             logger.debug("Send: {}".format(message))
         except Exception as e:
             logger.exception("Exception -> {}".format(e))
-        # Encrypt, adapt, etc...
         msg = (json.dumps(message, indent=4))
         self.send_obj(msg)
 
@@ -300,14 +297,13 @@ class Client(jsocket.JsonClient):
             d = json.loads(data)
             if d['type'] == 'SECURE':
                 logger.debug("We got a secure msg")
-                payload = base64.b64decode(d['payload']) # Bytes
+                payload = base64.b64decode(d['payload'])
                 h_mac = base64.b64decode(d['h_mac'])
                 dd = self.decrypt(payload, h_mac, d)
                 dec_data = json.loads(dd)
                 return dec_data
         except Exception as e:
             logger.exception("WTF is going on? -> {}".format(e))
-        # Decrypt, filter, etc..
 
         mtype = d.get('type', 'UNKNOWN')
         if mtype == 'ERROR':
@@ -325,7 +321,8 @@ class Client(jsocket.JsonClient):
         cipher = None
         block_size = 0
 
-        # Encrypt
+        # Encrypt ...
+
         # Algorithm
         if self.algorithm == 'AES':
             alg = algorithms.AES(self.key)
@@ -353,13 +350,9 @@ class Client(jsocket.JsonClient):
         padder = padding.PKCS7(block_size).padder()
         p_data = padder.update(msg) + padder.finalize()
         text = encryptor.update(p_data) + encryptor.finalize()
-        h = hmac.HMAC(self.key, sintese, backend=default_backend())
-        h.update(text)
-        h_mac = h.finalize()
-
-        # TODO: check this
-
-        # message = {'type': 'SECURE', 'payload': payload}
+        
+        # Integrity control (?)
+        h_mac = self.add_integrity_control(text, sintese)
 
         return text, h_mac
 
@@ -377,8 +370,7 @@ class Client(jsocket.JsonClient):
 
         cipher = None
         block_size = 0
-        #payload = message.get('payload')
-        #text, h_mac = payload
+        
         # TODO: duplicação de código. CHECK THIS
         # Algorithm
         if self.algorithm == 'AES':
@@ -404,32 +396,41 @@ class Client(jsocket.JsonClient):
         # Decrypt msg
         decryptor = cipher.decryptor()
         unpadder = padding.PKCS7(block_size).unpadder()
-        h = hmac.HMAC(self.key, sintese, backend=default_backend())
-        h.update(text)
-        h.verify(mac)
+        if self.verify_integrity_control(text, sintese, mac) is False:
+            raise Exception ("Integrity control failed")
         p_data = decryptor.update(text) + decryptor.finalize()
         data = unpadder.update(p_data) + unpadder.finalize()
         final_data = base64.b64decode(data)
         return final_data
 
 
-    def verify_integrity_control(self, message: dict) -> bool:
+    def verify_integrity_control(self, text, sintese, mac):
         """
             Verify the message integrity control
         
             :param message: A SECURE message
         """
+        try:
+            h = hmac.HMAC(self.key, sintese, backend=default_backend())
+            h.update(text)
+            h.verify(mac)
+        except Exception as e:
+            logger.exception("Integrity control failed -> {}".format(e))
+            return False
 
         return True
 
-    def add_integrity_control(self, message: dict) -> dict:
+    def add_integrity_control(self, text, sintese):
         """
-            Verify the message integrity control
+            Add message integrity control
 
             :param message: A SECURE message
         """
+        h = hmac.HMAC(self.key, sintese, backend=default_backend())
+        h.update(text)
+        h_mac = h.finalize()
 
-        return message
+        return h_mac
 
     # Auxiliar functions
     def password_validation_request(self):
