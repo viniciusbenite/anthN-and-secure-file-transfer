@@ -269,7 +269,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         self.server_nonce = base64.b64decode(message['nonce'])
 
         # Load server pri_key
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/certs/server.key", "rb") as f: 
+        with open("./certs/server.key", "rb") as f: 
             data = f.read()
             self.sv_crt_pri_key = serialization.load_pem_private_key(data, password=None, backend=default_backend())
 
@@ -283,7 +283,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         nonce = self.sv_crt_pri_key.sign(digested_hash, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
 
         # sv certificate
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/certs/server.crt", "rb") as f: 
+        with open("./certs/server.crt", "rb") as f: 
             data = f.read()
             self.sv_crt = x509.load_pem_x509_certificate(data, backend=default_backend())
         b_sv_cert = self.sv_crt.public_bytes(serialization.Encoding.DER)

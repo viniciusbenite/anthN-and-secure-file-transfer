@@ -184,7 +184,7 @@ class Client(jsocket.JsonClient):
         b_sv_crt = base64.b64decode(data["sv_cert"])
         self.sv_crt = x509.load_der_x509_certificate(b_sv_crt, backend=default_backend())
 
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/certs/rootCA.crt", "rb") as f:
+        with open("./certs/rootCA.crt", "rb") as f:
             data = f.read()
             self.rootCA_crt = x509.load_pem_x509_certificate(data, backend=default_backend())
 
@@ -473,11 +473,6 @@ class Client(jsocket.JsonClient):
         msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
         self.send(msg)
 
-    def issuers_sv(self, certificate, list_chain=[]):
-        pass
-
-    def verify_sv(self):
-        pass
 def main():
     parser = argparse.ArgumentParser(description='Gets files from servers.')
     parser.add_argument('-v', action='count', dest='verbose',
