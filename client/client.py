@@ -33,7 +33,8 @@ class Client(jsocket.JsonClient):
     def __init__(self, auth_mode, address="127.0.0.1", port=5000):
         super(Client, self).__init__(address, port)
 
-        self.auth_mode = auth_mode # Pass or CC
+        self.auth_mode = auth_mode # Pass only
+        self.server_crt = {}
 
         self.algorithm = None
         self.mode = None
@@ -165,7 +166,7 @@ class Client(jsocket.JsonClient):
         info=b'derivation',
         backend=default_backend()).derive(shared_key)
 
-        # Send request
+        # Send authentication request
         self.server_nonce = os.urandom(16)
         text = str.encode(json.dumps({ "type": 'AUTHN_REQ', "nonce": base64.b64encode(self.server_nonce).decode('utf-8') }))
         payload, mac = self.encrypt(text)
@@ -178,13 +179,12 @@ class Client(jsocket.JsonClient):
         mtype = data.get('type', 'UNKNOWN')
         if mtype != 'KEY_GEN_OK':
             raise Exception("Something went wrong in key gen")
-
         
         sv_nonce = base64.b64decode(data["nonce"])
         b_sv_crt = base64.b64decode(data["sv_cert"])
         self.sv_crt = x509.load_der_x509_certificate(b_sv_crt, backend=default_backend())
 
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/rootCA.crt", "rb") as f:
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/certs/rootCA.crt", "rb") as f:
             data = f.read()
             self.rootCA_crt = x509.load_pem_x509_certificate(data, backend=default_backend())
 
@@ -195,20 +195,20 @@ class Client(jsocket.JsonClient):
         hs.update(self.server_nonce)
         digest = hs.finalize()
 
+        # Verify the signature validation
         try:
             self.sv_crt_pub_key.verify(sv_nonce, digest, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
             logger.info("Server authenticated")
         except Exception as e:
-            #TODO fix this shit
+            #TODO fix this ... DONE!
             logger.exception("Invalid signature {}".format(e))
+            exit(1)
             
-        #TODO VALIDATE SERVER CHAIN
+        #TODO VALIDATE SERVER CHAIN ???
+        
 
         if self.auth_mode == "pass":
                 self.password_validation_request()
-        elif self.auth_mode == "cc":
-                # self.cc_validation_request()
-                pass
         else:
             self.send({ "type": "ERROR" })
             raise Exception("Authentication mode not suported")
@@ -435,13 +435,13 @@ class Client(jsocket.JsonClient):
     # Auxiliar functions
     def password_validation_request(self):
         """
-            Function to send a password chalange request to server.
+            Function to send a password challenge request to server.
         """
-        logger.info("REQUESTING PASSWORD CHALANGE")
+        logger.info("REQUESTING PASSWORD CHALLENGE")
         self.rsa_pri_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
         self.rsa_pub_key = self.rsa_pri_key.public_key()
         b_rsa_pub_key = self.rsa_pub_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-        text = str.encode(json.dumps({ "type": "PWD_CHALANGE_REQ", "RSA_PUB_KEY": base64.b64encode(b_rsa_pub_key).decode("utf-8") }))
+        text = str.encode(json.dumps({ "type": "PWD_CHALLENGE_REQ", "RSA_PUB_KEY": base64.b64encode(b_rsa_pub_key).decode("utf-8") }))
         payload, mac = self.encrypt(text)
         msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
         self.send(msg)
@@ -449,17 +449,17 @@ class Client(jsocket.JsonClient):
         try:
             reply = self.read()
             mtype = reply.get("type")
-            if mtype == "CHALANGE_PASS":
+            if mtype == "CHALLENGE_PASS":
                 self.password_validation_reply(reply)
         except Exception as e:
             logger.exception("Something went wrong ... {}".format(e))
 
     def password_validation_reply(self, message: str) -> None:
         """
-            Function to reply to the chalange sended by the server.
-            :param message: the chalange sended by server
+            Function to reply to the challenge sended by the server.
+            :param message: the challenge sended by server
         """
-        logger.info("REPLYING PASSWORD CHALANGE")
+        logger.info("REPLYING PASSWORD CHALLENGE")
         self.chalange_nonce = base64.b64decode(message["nonce"])
         self.user = input("Type you name: ")
         pwd = input("Type your password: ")
@@ -468,12 +468,16 @@ class Client(jsocket.JsonClient):
         hs.update(p)
         digest = hs.finalize()
         pass_signed = self.rsa_pri_key.sign(digest, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
-        text = str.encode(json.dumps( { "type": "CHALANGE_PWD_REP", "user": self.user, "password": base64.b64encode(pass_signed).decode("utf-8") }))
+        text = str.encode(json.dumps( { "type": "CHALLENGE_PWD_REP", "user": self.user, "password": base64.b64encode(pass_signed).decode("utf-8") }))
         payload, mac = self.encrypt(text)
         msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
         self.send(msg)
 
+    def issuers_sv(self, certificate, list_chain=[]):
+        pass
 
+    def verify_sv(self):
+        pass
 def main():
     parser = argparse.ArgumentParser(description='Gets files from servers.')
     parser.add_argument('-v', action='count', dest='verbose',

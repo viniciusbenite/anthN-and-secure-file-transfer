@@ -33,7 +33,7 @@ STATE_AUTHN = 3  # AUTHeNtication
 STATE_AUTHZ = 3  # AUTHoriZation
 STATE_GET = 4  # Data Transfer
 STATE_AGREEMENT = 5 # Negotiation phase
-STATE_CHALANGE = 6 # Chalange phase
+STATE_CHALLENGE = 6 # Challenge phase
 
 # GLOBAL
 backend = default_backend()
@@ -129,11 +129,11 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
                 mtype = dec_msg.get('type', '')
                 if mtype == 'AUTHN_REQ':
                     ret = self.process_authn(dec_msg)
-                elif mtype == "PWD_CHALANGE_REQ":
-                    self.send_chalange_pass(dec_msg)
+                elif mtype == "PWD_CHALLENGE_REQ":
+                    self.send_challenge_pass(dec_msg)
                     ret = True
-                elif mtype == "CHALANGE_PWD_REP":
-                    self.process_chalange_pass(dec_msg)
+                elif mtype == "CHALLENGE_PWD_REP":
+                    self.process_challenge_pass(dec_msg)
                     ret = True
                 elif mtype == "AUTHZ_REQ":
                     ret = self.process_authz(dec_msg)
@@ -269,7 +269,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         self.server_nonce = base64.b64decode(message['nonce'])
 
         # Load server pri_key
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/sv-key.pem", "rb") as f: 
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/certs/server.key", "rb") as f: 
             data = f.read()
             self.sv_crt_pri_key = serialization.load_pem_private_key(data, password=None, backend=default_backend())
 
@@ -283,7 +283,7 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
         nonce = self.sv_crt_pri_key.sign(digested_hash, padder.PSS(mgf=padder.MGF1(hashes.SHA256()), salt_length=padder.PSS.MAX_LENGTH), utils.Prehashed(hashes.SHA256()))
 
         # sv certificate
-        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/server/sv-keys/server.crt", "rb") as f: 
+        with open("/home/vinicius/Desktop/sio-1920-proj_época_especial/certs/server.crt", "rb") as f: 
             data = f.read()
             self.sv_crt = x509.load_pem_x509_certificate(data, backend=default_backend())
         b_sv_cert = self.sv_crt.public_bytes(serialization.Encoding.DER)
@@ -301,35 +301,35 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 
         # In the last message of this process advance the state
         logger.info("ADVANCING STATE")
-        self.state = STATE_CHALANGE
+        self.state = STATE_CHALLENGE
         return True
 
-    def send_chalange_pass(self, message: str) -> None:
+    def send_challenge_pass(self, message: str) -> None:
         """
-            Send a password chalange to the client
-            :param message: chalange request from client
+            Send a password challenge to the client
+            :param message: challenge request from client
         """
-        if self.state != STATE_CHALANGE:
-            logger.warning("Invalid state (CHALANGE). Discarding")
+        if self.state != STATE_CHALLENGE:
+            logger.warning("Invalid state (CHALLENGE). Discarding")
             raise Exception("Something went wront while sending chalange pass")
-        logger.info("SENDING CHALANGE PASSWORD")
+        logger.info("SENDING CHALLENGE PASSWORD")
         b_rsa_client_pub_key = base64.b64decode(message['RSA_PUB_KEY'])
         self.rsa_client_pub_key = serialization.load_der_public_key(b_rsa_client_pub_key, backend=default_backend())
         self.chalenge_nonce = os.urandom(16)
-        text = str.encode(json.dumps({ "type": 'CHALANGE_PASS', "nonce": base64.b64encode(self.chalenge_nonce).decode("utf-8") }))
+        text = str.encode(json.dumps({ "type": 'CHALLENGE_PASS', "nonce": base64.b64encode(self.chalenge_nonce).decode("utf-8") }))
         payload, mac = self.encrypt(text)
         msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
         self.send(msg)
 
-    def process_chalange_pass(self, message: str) -> None:
+    def process_challenge_pass(self, message: str) -> None:
         """
-            Verify if the chalange reply is corrent
-            :param message: chalange reply from client
+            Verify if the challenge reply is corrent
+            :param message: challenge reply from client
         """
-        if self.state != STATE_CHALANGE:
-            logger.warning("Invalid state (CHALANGE). Discarding")
+        if self.state != STATE_CHALLENGE:
+            logger.warning("Invalid state (CHALLENGE). Discarding")
             raise Exception("WRONG STATE!!")
-        logger.info("PROCESSING CHALANGE PASSWORD")
+        logger.info("PROCESSING CHALLENGE PASSWORD")
         self.user = message["user"]
         self.pwd = base64.b64decode(message["password"])
         if self.user not in user_list.keys():
@@ -409,12 +409,13 @@ class ServerFactoryThread(jsocket.ServerFactoryThread):
 
         payload = binascii.b2a_base64(file.read()).decode('ascii').strip()
         logger.info("Payload: {}".format(payload))
-
         data = str.encode(json.dumps({
             'type': 'DATA',
             'file_name': file_name,
             'payload': payload
         }))
+
+        # Encrypt file
         payload, mac = self.encrypt(data)
         msg = { "type": "SECURE", "payload": base64.b64encode(payload).decode("utf-8"), "h_mac": base64.b64encode(mac).decode("utf-8") }
         self.send(msg)
