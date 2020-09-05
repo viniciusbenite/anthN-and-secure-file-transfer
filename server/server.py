@@ -53,7 +53,7 @@ user_list = {'vinicius':
                  'can_connect': True,
                  'can_read': True
              }
-             }
+    }
 
 storage_dir = 'files'
 

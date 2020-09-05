@@ -351,7 +351,7 @@ class Client(jsocket.JsonClient):
         p_data = padder.update(msg) + padder.finalize()
         text = encryptor.update(p_data) + encryptor.finalize()
         
-        # Integrity control (?)
+        # Integrity control
         h_mac = self.add_integrity_control(text, sintese)
 
         return text, h_mac
